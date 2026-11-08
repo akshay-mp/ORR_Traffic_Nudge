@@ -1,0 +1,6 @@
+{
+  "name": "ORR Pulse — Bengaluru Commute & ETA Reliability Pilot",
+  "description": "Mobile-first employee commute planner and departure-time decision system for Prestige Tech Park, Bengaluru, featuring traffic-aware Car, Two-Wheeler, and BMTC Transit routing, proactive deterioration alerts, and immutable 5-minute ETA trust measurement.",
+  "requestFramePermissions": ["geolocation"],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
