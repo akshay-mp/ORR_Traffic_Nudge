@@ -1,0 +1,33 @@
+{
+  "expo": {
+    "name": "ORR Pulse",
+    "slug": "orr-pulse",
+    "version": "1.0.0",
+    "orientation": "portrait",
+    "icon": "./assets/icon.png",
+    "scheme": "orrpulse",
+    "userInterfaceStyle": "automatic",
+    "plugins": [
+      "expo-status-bar",
+      "expo-secure-store",
+      "expo-font",
+      "expo-splash-screen",
+      "expo-notifications"
+    ],
+    "ios": {
+      "bundleIdentifier": "com.orrpulse.pilot",
+      "supportsTablet": true
+    },
+    "android": {
+      "package": "com.orrpulse.pilot",
+      "adaptiveIcon": {
+        "foregroundImage": "./assets/adaptive-icon.png",
+        "backgroundColor": "#10243E"
+      }
+    },
+    "platforms": [
+      "ios",
+      "android"
+    ]
+  }
+}

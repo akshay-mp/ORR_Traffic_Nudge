@@ -2,639 +2,110 @@ import dotenv from 'dotenv';
 import express, { NextFunction, Request, Response } from 'express';
 import fs from 'fs';
 import path from 'path';
+import { DatabaseSync } from 'node:sqlite';
 import { fileURLToPath } from 'url';
+
 import {
-  BMTC_TIMETABLE_LIMITATION_NOTE,
   buildDepartureRecommendations,
-  computeDemoSlotPrediction,
   computeJourneyMetrics,
   computePilotMetricsReport,
   correctJourneyActualTimes,
   createImmutableSnapshot,
   evaluateMonitoringUpdate,
-  generateCandidateDepartureTimes,
   getNowIstParts,
-  hhmmToMinutes,
   isoToIstHhmm,
   isoToIstWithSec,
   istDateAndHhmmToIso,
   PRESTIGE_TECH_PARK_DEFAULT,
-  resolveEffectiveSchedule,
-  SlotPredictionInput,
 } from './src/lib/commuteEngine';
 import {
-  INITIAL_DEMO_JOURNEYS,
   INITIAL_PILOT_EMPLOYEES,
   PilotUserSeed,
 } from './src/lib/pilotSeed';
 import {
   ApiQuotaStatus,
   CommuteAlert,
-  CommuteDirection,
   DataEnvironment,
   DayOverride,
-  DirectionSchedule,
   JourneyRecord,
   LocationPoint,
   MonitoringSession,
-  TransitStepDetail,
-  TransportMode,
-  UserProfile,
 } from './src/types/commute';
+
+import { openDatabase } from './src/server/db';
+import {
+  checkBudgetAndIncrement as checkBudgetAndIncrementInDb,
+  createStore,
+  deleteUserJourneysAndAlerts,
+  mutateQuotaPersistSafe,
+  PersistentStore,
+  persistStore,
+  reloadWorkingSet,
+  restoreStore,
+  snapshotStore,
+  StoreError,
+} from './src/server/store';
+import { issueToken, resolveTokenUser } from './src/server/auth';
+import {
+  createComputeOptions,
+  getGoogleMapsApiKey,
+  OptionsProviderOverride,
+  ROUTES_REQUEST_TIMEOUT_MS,
+} from './src/server/options';
+import { Scheduler } from './src/server/scheduler';
+import {
+  createExpoHttpTransport,
+  enqueueAlertsForPushInTransaction,
+  listDevices,
+  outboxStatus,
+  PushTransport,
+  registerDevice,
+  removeDevice,
+  validateDeviceRegistration,
+} from './src/server/push';
 
 dotenv.config();
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
-const DATA_DIR = path.join(__dirname, '.data');
-const STORE_PATH = path.join(DATA_DIR, 'orr_pulse_store.json');
-
-interface PersistentStore {
-  users: PilotUserSeed[];
-  sessions: MonitoringSession[];
-  alerts: CommuteAlert[];
-  journeys: JourneyRecord[];
-  quota: ApiQuotaStatus;
-  tokens: Record<string, string>; // token -> userId
+export interface AppOptions {
+  /** Data directory for the SQLite database (defaults to ./.data). */
+  dataDir?: string;
+  /** Environment snapshot (tests inject one; CLI uses process.env). */
+  env?: NodeJS.ProcessEnv;
+  /** Test seam replacing all provider computation (never touches network). */
+  providerOverride?: OptionsProviderOverride;
+  /** Push transport (tests inject a mock; default is the env-gated Expo adapter). */
+  pushTransport?: PushTransport;
+  /** Skip the Vite/static web stack (used by tests). */
+  skipWebStack?: boolean;
 }
 
-function getGoogleMapsApiKey(): string {
-  return (
-    process.env.GOOGLE_MAPS_API_KEY ||
-    process.env.VITE_GOOGLE_MAPS_API_KEY ||
-    process.env.MAPS_API_KEY ||
-    ''
-  ).trim();
-}
-
-function loadOrInitStore(): PersistentStore {
-  if (!fs.existsSync(DATA_DIR)) {
-    fs.mkdirSync(DATA_DIR, { recursive: true });
-  }
-  const { dateIst } = getNowIstParts();
-  const defaultLimit = parseInt(process.env.DAILY_API_QUOTA_LIMIT || '500', 10) || 500;
-
-  if (fs.existsSync(STORE_PATH)) {
-    try {
-      const raw = fs.readFileSync(STORE_PATH, 'utf-8');
-      const parsed = JSON.parse(raw) as PersistentStore;
-      if (parsed.quota.dateIst !== dateIst) {
-        parsed.quota.dateIst = dateIst;
-        parsed.quota.requestsUsedToday = 0;
-        parsed.quota.routesRequests = 0;
-        parsed.quota.placesRequests = 0;
-        parsed.quota.geocodingRequests = 0;
-      }
-      parsed.quota.liveApiConfigured = Boolean(getGoogleMapsApiKey());
-      return parsed;
-    } catch (err) {
-      console.error('Failed to parse store, re-initializing:', err);
-    }
-  }
-
-  const initialTokens: Record<string, string> = {};
-  for (const emp of INITIAL_PILOT_EMPLOYEES) {
-    initialTokens[`token_${emp.id}_pilot`] = emp.id;
-  }
-
-  const initialStore: PersistentStore = {
-    users: structuredClone(INITIAL_PILOT_EMPLOYEES),
-    sessions: [],
-    alerts: [],
-    journeys: structuredClone(INITIAL_DEMO_JOURNEYS),
-    quota: {
-      dateIst,
-      dailyLimit: defaultLimit,
-      requestsUsedToday: 0,
-      routesRequests: 0,
-      placesRequests: 0,
-      geocodingRequests: 0,
-      lastProviderStatus: getGoogleMapsApiKey() ? 'OK' : 'UNCONFIGURED',
-      lastErrorMessage: null,
-      liveApiConfigured: Boolean(getGoogleMapsApiKey()),
-    },
-    tokens: initialTokens,
-  };
-
-  saveStore(initialStore);
-  return initialStore;
-}
-
-function saveStore(store: PersistentStore): void {
-  try {
-    if (!fs.existsSync(DATA_DIR)) {
-      fs.mkdirSync(DATA_DIR, { recursive: true });
-    }
-    fs.writeFileSync(STORE_PATH, JSON.stringify(store, null, 2), 'utf-8');
-  } catch (err) {
-    console.error('Error saving persistent store:', err);
+class SessionWriteConflict extends Error {
+  constructor() {
+    super('Monitoring session changed during request');
+    this.name = 'SessionWriteConflict';
   }
 }
 
-const store = loadOrInitStore();
+export interface AppHandle {
+  app: express.Express;
+  store: PersistentStore;
+  db: DatabaseSync;
+  scheduler: Scheduler;
+  transport: PushTransport;
+  migrationNote: string | null;
+  close(): void;
+}
 
-function sanitizeUserProfile(u: PilotUserSeed): UserProfile {
+function sanitizeUserProfile(u: PilotUserSeed) {
   const { pin: _pin, ...profile } = u;
   return profile;
 }
 
 interface AuthedRequest extends Request {
   user?: PilotUserSeed;
-}
-
-function requireAuth(req: AuthedRequest, res: Response, next: NextFunction): void {
-  const authHeader = req.headers.authorization || '';
-  const token = authHeader.startsWith('Bearer ')
-    ? authHeader.slice(7).trim()
-    : '';
-
-  if (!token || !store.tokens[token]) {
-    res.status(401).json({
-      error: 'UNAUTHORIZED',
-      message: 'Valid employee session token required.',
-    });
-    return;
-  }
-
-  const userId = store.tokens[token];
-  const user = store.users.find((u) => u.id === userId);
-  if (!user) {
-    res.status(401).json({
-      error: 'UNAUTHORIZED',
-      message: 'Pilot employee profile not found.',
-    });
-    return;
-  }
-
-  req.user = user;
-  next();
-}
-
-function checkBudgetAndIncrement(
-  type: 'ROUTES' | 'PLACES' | 'GEOCODING'
-): { allowed: boolean; reason?: string } {
-  const { dateIst } = getNowIstParts();
-  if (store.quota.dateIst !== dateIst) {
-    store.quota.dateIst = dateIst;
-    store.quota.requestsUsedToday = 0;
-    store.quota.routesRequests = 0;
-    store.quota.placesRequests = 0;
-    store.quota.geocodingRequests = 0;
-  }
-
-  if (store.quota.requestsUsedToday >= store.quota.dailyLimit) {
-    store.quota.lastProviderStatus = 'QUOTA_EXCEEDED';
-    store.quota.lastErrorMessage = `Pilot daily API budget safeguard reached (${store.quota.dailyLimit} requests/day).`;
-    saveStore(store);
-    return {
-      allowed: false,
-      reason: store.quota.lastErrorMessage,
-    };
-  }
-
-  store.quota.requestsUsedToday += 1;
-  if (type === 'ROUTES') store.quota.routesRequests += 1;
-  if (type === 'PLACES') store.quota.placesRequests += 1;
-  if (type === 'GEOCODING') store.quota.geocodingRequests += 1;
-  saveStore(store);
-  return { allowed: true };
-}
-
-/**
- * Calls Google Maps Platform Routes API v2 (`directions/v2:computeRoutes`) on the server.
- * Enforces mode separation:
- * - CAR -> DRIVE + TRAFFIC_AWARE_OPTIMAL
- * - BIKE -> TWO_WHEELER + TRAFFIC_AWARE_OPTIMAL (never BICYCLE, never CAR)
- * - BMTC -> TRANSIT + BUS (never invents live BMTC GPS feeds; labels timetable vs live)
- */
-async function computeLiveSlotPrediction(params: {
-  origin: LocationPoint;
-  destination: LocationPoint;
-  mode: TransportMode;
-  departureTimeIst: string;
-  departureIso: string;
-  isNowSlot: boolean;
-}): Promise<{
-  supported: boolean;
-  unsupportedReason?: string;
-  quotaExceeded?: boolean;
-  providerError?: string;
-  prediction?: SlotPredictionInput;
-}> {
-  const apiKey = getGoogleMapsApiKey();
-  if (!apiKey) {
-    store.quota.liveApiConfigured = false;
-    store.quota.lastProviderStatus = 'UNCONFIGURED';
-    return {
-      supported: false,
-      providerError:
-        'Google Maps Platform API key is not configured on the server. Switch to Labeled Demo Mode or configure GOOGLE_MAPS_API_KEY.',
-    };
-  }
-
-  const budgetCheck = checkBudgetAndIncrement('ROUTES');
-  if (!budgetCheck.allowed) {
-    return {
-      supported: false,
-      quotaExceeded: true,
-      providerError: budgetCheck.reason,
-    };
-  }
-
-  const { origin, destination, mode, departureTimeIst, departureIso, isNowSlot } = params;
-  const endpoint = 'https://routes.googleapis.com/directions/v2:computeRoutes';
-
-  const originWaypoint = {
-    location: {
-      latLng: {
-        latitude: origin.lat,
-        longitude: origin.lng,
-      },
-    },
-  };
-  const destinationWaypoint = {
-    location: {
-      latLng: {
-        latitude: destination.lat,
-        longitude: destination.lng,
-      },
-    },
-  };
-
-  // Ensure departureTime is strictly in the future if sent to Routes API
-  const depEpochMs = new Date(departureIso).getTime();
-  const nowEpochMs = Date.now();
-  const isFutureDeparture = depEpochMs > nowEpochMs + 90 * 1000;
-  const safeFutureIso = isFutureDeparture
-    ? new Date(depEpochMs).toISOString()
-    : new Date(nowEpochMs + 120 * 1000).toISOString();
-
-  let requestBody: Record<string, unknown>;
-  let fieldMask: string;
-
-  if (mode === 'CAR') {
-    requestBody = {
-      origin: originWaypoint,
-      destination: destinationWaypoint,
-      travelMode: 'DRIVE',
-      routingPreference: 'TRAFFIC_AWARE_OPTIMAL',
-      languageCode: 'en-IN',
-      regionCode: 'IN',
-      units: 'METRIC',
-      ...(isFutureDeparture ? { departureTime: safeFutureIso } : {}),
-    };
-    fieldMask =
-      'routes.duration,routes.staticDuration,routes.distanceMeters,routes.description';
-  } else if (mode === 'BIKE') {
-    // Motorized Two-Wheeler mode (distinct from human-powered BICYCLE and CAR)
-    requestBody = {
-      origin: originWaypoint,
-      destination: destinationWaypoint,
-      travelMode: 'TWO_WHEELER',
-      routingPreference: 'TRAFFIC_AWARE_OPTIMAL',
-      languageCode: 'en-IN',
-      regionCode: 'IN',
-      units: 'METRIC',
-      ...(isFutureDeparture ? { departureTime: safeFutureIso } : {}),
-    };
-    fieldMask =
-      'routes.duration,routes.staticDuration,routes.distanceMeters,routes.description';
-  } else {
-    // BMTC Bus -> TRANSIT mode with BUS filter
-    // Note: TRANSIT does not support top-level routingPreference
-    requestBody = {
-      origin: originWaypoint,
-      destination: destinationWaypoint,
-      travelMode: 'TRANSIT',
-      transitPreferences: {
-        allowedTravelModes: ['BUS'],
-        routingPreference: 'FEWER_TRANSFERS',
-      },
-      departureTime: safeFutureIso,
-      languageCode: 'en-IN',
-      regionCode: 'IN',
-      units: 'METRIC',
-    };
-    fieldMask =
-      'routes.duration,routes.staticDuration,routes.distanceMeters,routes.description,routes.legs.steps.travelMode,routes.legs.steps.staticDuration,routes.legs.steps.transitDetails,routes.legs.steps.navigationInstruction';
-  }
-
-  try {
-    const response = await fetch(endpoint, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'X-Goog-Api-Key': apiKey,
-        'X-Goog-FieldMask': fieldMask,
-        'X-Goog-Maps-Solution-ID': 'gmp_mcp_codeassist_v1_aistudio',
-      },
-      body: JSON.stringify(requestBody),
-    });
-
-    if (response.status === 429) {
-      store.quota.lastProviderStatus = 'QUOTA_EXCEEDED';
-      store.quota.lastErrorMessage = 'Google Maps Platform Routes API quota exceeded (HTTP 429).';
-      saveStore(store);
-      return {
-        supported: false,
-        quotaExceeded: true,
-        providerError: store.quota.lastErrorMessage,
-      };
-    }
-
-    const payload = (await response.json()) as any;
-
-    if (!response.ok) {
-      const errStatus = payload?.error?.status || '';
-      const errMsg = payload?.error?.message || `HTTP ${response.status}`;
-      if (errStatus === 'RESOURCE_EXHAUSTED' || errMsg.includes('Quota')) {
-        store.quota.lastProviderStatus = 'QUOTA_EXCEEDED';
-        store.quota.lastErrorMessage = errMsg;
-        saveStore(store);
-        return {
-          supported: false,
-          quotaExceeded: true,
-          providerError: errMsg,
-        };
-      }
-      store.quota.lastProviderStatus = 'PROVIDER_ERROR';
-      store.quota.lastErrorMessage = errMsg;
-      saveStore(store);
-      return {
-        supported: false,
-        providerError: `Routes API Error (${errStatus || response.status}): ${errMsg}`,
-      };
-    }
-
-    store.quota.lastProviderStatus = 'OK';
-    store.quota.lastErrorMessage = null;
-    saveStore(store);
-
-    const route = payload?.routes?.[0];
-    if (!route) {
-      if (mode === 'BMTC') {
-        return {
-          supported: false,
-          unsupportedReason:
-            'Google Maps Routes API returned no scheduled BMTC bus route between these locations for the requested departure time.',
-        };
-      }
-      if (mode === 'BIKE') {
-        return {
-          supported: false,
-          unsupportedReason:
-            'Google Maps Routes API returned no motorized two-wheeler (TWO_WHEELER) route for this origin–destination pair.',
-        };
-      }
-      return {
-        supported: false,
-        unsupportedReason:
-          'No drivable route found between the selected origin and destination.',
-      };
-    }
-
-    const parseSec = (durStr?: string): number => {
-      if (!durStr) return 0;
-      return parseInt(String(durStr).replace('s', ''), 10) || 0;
-    };
-
-    const durationSec = parseSec(route.duration);
-    const staticDurationSec = parseSec(route.staticDuration) || durationSec;
-    const predictedDurationMin = Math.max(1, Math.round(durationSec / 60));
-    const staticDurationMin = Math.max(1, Math.round(staticDurationSec / 60));
-    const distanceKm = Number(((route.distanceMeters || 5000) / 1000).toFixed(1));
-    const corridorSummary =
-      route.description ||
-      (mode === 'BMTC' ? 'BMTC Bus Corridor' : 'Outer Ring Road Corridor');
-
-    if (mode === 'BMTC') {
-      const rawSteps: any[] = route.legs?.[0]?.steps || [];
-      let walkingSec = 0;
-      let inVehicleSec = 0;
-      const busLines: string[] = [];
-      const steps: TransitStepDetail[] = [];
-
-      for (const st of rawSteps) {
-        const stDurMin = Math.max(1, Math.round(parseSec(st.staticDuration) / 60));
-        if (st.travelMode === 'WALK') {
-          walkingSec += parseSec(st.staticDuration);
-          steps.push({
-            stepType: 'WALK',
-            durationMin: stDurMin,
-            instruction:
-              st.navigationInstruction?.instructions || 'Walk to transit stop',
-          });
-        } else if (st.travelMode === 'TRANSIT' || st.transitDetails) {
-          inVehicleSec += parseSec(st.staticDuration);
-          const td = st.transitDetails || {};
-          const lineName =
-            td.transitLine?.nameShort ||
-            td.transitLine?.name ||
-            'BMTC Bus';
-          if (lineName && !busLines.includes(lineName)) {
-            busLines.push(lineName);
-          }
-          steps.push({
-            stepType: 'BUS',
-            durationMin: stDurMin,
-            instruction: `Take ${lineName} towards ${td.headsign || 'destination'}`,
-            busRouteNumber: lineName,
-            departureStop: td.stopDetails?.departureStop?.name,
-            arrivalStop: td.stopDetails?.arrivalStop?.name,
-            numStops: td.stopCount,
-          });
-        }
-      }
-
-      const walkingMin = Math.max(1, Math.round(walkingSec / 60));
-      const inVehicleMin = Math.max(1, Math.round(inVehicleSec / 60));
-      const waitingMin = Math.max(0, predictedDurationMin - walkingMin - inVehicleMin);
-      const transfersCount = Math.max(0, busLines.length - 1);
-
-      return {
-        supported: true,
-        prediction: {
-          departureTimeIst,
-          departureIso,
-          isNowSlot,
-          predictedDurationMin,
-          staticDurationMin,
-          estimateBasis: 'TIMETABLE',
-          dataSource: 'Google Maps Routes API v2 (BMTC GTFS Timetable)',
-          environment: 'LIVE',
-          distanceKm,
-          corridorSummary:
-            busLines.length > 0
-              ? `BMTC ${busLines.join(' → ')} (${corridorSummary})`
-              : corridorSummary,
-          transitDetails: {
-            isLiveFeed: false,
-            walkingMin,
-            waitingMin,
-            inVehicleMin,
-            transfersCount,
-            busLines: busLines.length > 0 ? busLines : ['BMTC Transit'],
-            steps,
-            limitationNote: BMTC_TIMETABLE_LIMITATION_NOTE,
-          },
-        },
-      };
-    }
-
-    const minBound = Math.min(staticDurationMin, predictedDurationMin);
-    const maxBound = Math.max(staticDurationMin, predictedDurationMin);
-
-    return {
-      supported: true,
-      prediction: {
-        departureTimeIst,
-        departureIso,
-        isNowSlot,
-        predictedDurationMin,
-        staticDurationMin,
-        durationRangeMin:
-          maxBound > minBound ? [minBound, maxBound + 3] : undefined,
-        estimateBasis: isNowSlot ? 'CURRENT_TRAFFIC' : 'FUTURE_FORECAST',
-        dataSource: `Google Maps Routes API v2 (${mode === 'BIKE' ? 'TWO_WHEELER' : 'DRIVE'})`,
-        environment: 'LIVE',
-        distanceKm,
-        corridorSummary,
-      },
-    };
-  } catch (err: any) {
-    store.quota.lastProviderStatus = 'PROVIDER_ERROR';
-    store.quota.lastErrorMessage = err?.message || 'Network failure calling Routes API';
-    saveStore(store);
-    return {
-      supported: false,
-      providerError: store.quota.lastErrorMessage || 'Network failure calling Routes API',
-    };
-  }
-}
-
-async function computeOptionsForUserDirection(params: {
-  user: PilotUserSeed;
-  direction: CommuteDirection;
-  environment: DataEnvironment;
-  simulateTrafficSpikeMin?: number;
-}): Promise<{
-  options: ReturnType<typeof buildDepartureRecommendations>;
-  effectiveSchedule: ReturnType<typeof resolveEffectiveSchedule>;
-  unsupportedReason?: string;
-  quotaExceeded?: boolean;
-  providerError?: string;
-}> {
-  const { user, direction, environment, simulateTrafficSpikeMin = 0 } = params;
-  const { dateIst, timeIst } = getNowIstParts();
-  const nowIso = new Date().toISOString();
-
-  const baseSchedule = user.schedules[direction];
-  const effectiveSchedule = resolveEffectiveSchedule(
-    baseSchedule,
-    user.dayOverrides,
-    dateIst
-  );
-
-  if (!user.homeLocation) {
-    return {
-      options: [],
-      effectiveSchedule,
-      unsupportedReason:
-        'Home location is not configured yet. Please enter and confirm your home address in Commute Setup.',
-    };
-  }
-
-  const origin =
-    direction === 'HOME_TO_WORK' ? user.homeLocation : user.workLocation;
-  const destination =
-    direction === 'HOME_TO_WORK' ? user.workLocation : user.homeLocation;
-
-  const candidateSlots = generateCandidateDepartureTimes(
-    effectiveSchedule.windowStart,
-    effectiveSchedule.windowEnd,
-    effectiveSchedule.preferredDeparture,
-    timeIst
-  );
-
-  // Limit live slots to at most 3 key slots (e.g. Leave Now / Earliest, Preferred, Latest in window) to conserve API quota
-  const selectedSlots =
-    environment === 'LIVE' && candidateSlots.length > 3
-      ? [
-          candidateSlots[0],
-          candidateSlots[Math.floor(candidateSlots.length / 2)],
-          candidateSlots[candidateSlots.length - 1],
-        ]
-      : candidateSlots;
-
-  const predictions: SlotPredictionInput[] = [];
-
-  for (const slot of selectedSlots) {
-    const depIso = istDateAndHhmmToIso(dateIst, slot.hhmm);
-
-    if (environment === 'DEMO') {
-      const demoRes = computeDemoSlotPrediction({
-        origin,
-        destination,
-        mode: effectiveSchedule.mode,
-        departureTimeIst: slot.hhmm,
-        departureIso: depIso,
-        isNowSlot: slot.isNow,
-        simulateTrafficSpikeMin,
-      });
-      if (!demoRes.supported) {
-        return {
-          options: [],
-          effectiveSchedule,
-          unsupportedReason: demoRes.unsupportedReason,
-        };
-      }
-      if (demoRes.prediction) {
-        predictions.push(demoRes.prediction);
-      }
-    } else {
-      // Strictly LIVE mode: never silently fall back to synthetic demo predictions!
-      const liveRes = await computeLiveSlotPrediction({
-        origin,
-        destination,
-        mode: effectiveSchedule.mode,
-        departureTimeIst: slot.hhmm,
-        departureIso: depIso,
-        isNowSlot: slot.isNow,
-      });
-
-      if (liveRes.quotaExceeded || liveRes.providerError) {
-        return {
-          options: [],
-          effectiveSchedule,
-          quotaExceeded: liveRes.quotaExceeded,
-          providerError: liveRes.providerError,
-        };
-      }
-      if (!liveRes.supported) {
-        return {
-          options: [],
-          effectiveSchedule,
-          unsupportedReason: liveRes.unsupportedReason,
-        };
-      }
-      if (liveRes.prediction) {
-        predictions.push(liveRes.prediction);
-      }
-    }
-  }
-
-  const options = buildDepartureRecommendations({
-    dateIst,
-    nowIso,
-    schedule: effectiveSchedule,
-    slotPredictions: predictions,
-  });
-
-  return {
-    options,
-    effectiveSchedule,
-  };
 }
 
 // Curated Bengaluru neighborhoods for instant confirmation in Labeled Demo Mode or manual search
@@ -730,9 +201,126 @@ const BENGALURU_PILOT_PLACES: LocationPoint[] = [
   },
 ];
 
-async function createApp() {
+export async function createApp(options: AppOptions = {}): Promise<AppHandle> {
+  const env = options.env ?? process.env;
+  const dataDir = options.dataDir ?? env.DATA_DIR ?? path.join(__dirname, '.data');
+  const defaultLimit =
+    parseInt(env.DAILY_API_QUOTA_LIMIT || '500', 10) || 500;
+  const liveApiConfigured = Boolean(getGoogleMapsApiKey(env));
+
+  const { db } = openDatabase(dataDir);
+  const { store, migrationNote } = createStore(db, dataDir, {
+    defaultQuotaLimit: defaultLimit,
+    liveApiConfigured,
+  });
+  if (migrationNote) {
+    console.log(`[store] ${migrationNote}`);
+  }
+
+  const transport =
+    options.pushTransport ?? createExpoHttpTransport(env);
+  const computeOptions = createComputeOptions({
+    db,
+    store,
+    env: () => env,
+    providerOverride: options.providerOverride,
+  });
+  const scheduler = new Scheduler({ db, store, computeOptions, transport });
+
+  /**
+   * Runs a mutating request body with a pre-mutation working-set snapshot.
+   * Any failure (notably a failed persistence transaction) restores memory
+   * from the snapshot and re-reads the last committed SQLite state when
+   * readable, then rethrows so the route fails loudly. A rejected write can
+   * never surface in later reads nor be committed by a later success.
+   */
+  async function runMutating<T>(fn: () => T | Promise<T>): Promise<T> {
+    const snapshot = snapshotStore(store);
+    try {
+      return await fn();
+    } catch (err) {
+      restoreStore(store, snapshot);
+      try {
+        reloadWorkingSet(db, store);
+      } catch {
+        /* DB unreadable (e.g. closed); snapshot restore already applied */
+      }
+      throw err;
+    }
+  }
+
+  /**
+   * Atomic full-state persist; throws StoreError on any failure so routes
+   * fail loudly with 500 PERSISTENCE_FAILED (runMutating has already
+   * restored the working set by then).
+   */
+  function persistAll(
+    persistRelatedRows?: () => void,
+    beforePersist?: () => void
+  ): void {
+    persistStore(db, store, persistRelatedRows, beforePersist);
+  }
+
+  /**
+   * Records generated alerts atomically: memory first (reverted by
+   * persistAll's snapshot on failure), one transactional persist including
+   * the alerts, and durable push-outbox enqueue only after a successful
+   * commit.
+   */
+  function recordGeneratedAlerts(
+    alerts: CommuteAlert[],
+    beforePersist?: () => void
+  ): void {
+    if (alerts.length > 0) store.alerts.unshift(...alerts);
+    persistAll(() =>
+      enqueueAlertsForPushInTransaction(db, alerts, {
+        getUsers: () => store.users,
+        getSessionDirection: (sessionId) =>
+          store.sessions.find((s) => s.id === sessionId)?.direction ?? null,
+      }),
+      beforePersist
+    );
+  }
+
+  function checkBudgetAndIncrement(
+    type: 'ROUTES' | 'PLACES' | 'GEOCODING'
+  ): { allowed: boolean; reason?: string } {
+    return checkBudgetAndIncrementInDb(db, store, type);
+  }
+
   const app = express();
   app.use(express.json());
+
+  function requireAuth(
+    req: AuthedRequest,
+    res: Response,
+    next: NextFunction
+  ): void {
+    const authHeader = req.headers.authorization || '';
+    const token = authHeader.startsWith('Bearer ')
+      ? authHeader.slice(7).trim()
+      : '';
+
+    if (!token) {
+      res.status(401).json({
+        error: 'UNAUTHORIZED',
+        message: 'Valid employee session token required.',
+      });
+      return;
+    }
+
+    const user = resolveTokenUser(db, store.users, token);
+    if (!user) {
+      res.status(401).json({
+        error: 'UNAUTHORIZED',
+        message: 'Valid employee session token required.',
+      });
+      return;
+    }
+
+    req.user = user;
+    next();
+  }
 
   // 1. Public list of the 10 pilot employee slots (only id, code, name, role, corridorTag — never home address or trips!)
   app.get('/api/auth/pilot-roster', (_req, res) => {
@@ -748,11 +336,14 @@ async function createApp() {
       roster,
       serverTimeIst: getNowIstParts().timeWithSecIst,
       dateIst: getNowIstParts().dateIst,
-      liveApiConfigured: Boolean(getGoogleMapsApiKey()),
+      liveApiConfigured: Boolean(getGoogleMapsApiKey(env)),
     });
   });
 
-  // 2. Authenticate as a pilot employee
+  // 2. Authenticate as a pilot employee.
+  // Newly issued tokens are cryptographically random and stored only as
+  // SHA-256 hashes. The seeded `token_<id>_pilot` tokens remain accepted for
+  // pilot compatibility (pilot-only limitation, see docs/backend-mobile.md).
   app.post('/api/auth/login', (req, res) => {
     const { userId, pin } = req.body || {};
     const user = store.users.find((u) => u.id === userId || u.employeeCode === userId);
@@ -764,9 +355,7 @@ async function createApp() {
       res.status(403).json({ error: 'INVALID_PIN', message: 'Invalid 4-digit employee PIN.' });
       return;
     }
-    const token = `token_${user.id}_pilot`;
-    store.tokens[token] = user.id;
-    saveStore(store);
+    const token = issueToken(db, user.id);
 
     res.json({
       token,
@@ -779,9 +368,13 @@ async function createApp() {
     const user = req.user!;
     const { dateIst, timeIst, timeWithSecIst, dayOfWeek } = getNowIstParts();
 
-    const userSessions = store.sessions.filter(
-      (s) => s.userId === user.id && s.dateIst === dateIst
-    );
+    const userSessions = store.sessions
+      .filter((s) => s.userId === user.id && s.dateIst === dateIst)
+      .sort((a, b) => {
+        const startedDifference =
+          new Date(b.startedAtIso).getTime() - new Date(a.startedAtIso).getTime();
+        return startedDifference || b.id.localeCompare(a.id);
+      });
     const userAlerts = store.alerts
       .filter((a) => a.userId === user.id)
       .sort((a, b) => new Date(b.createdAtIso).getTime() - new Date(a.createdAtIso).getTime());
@@ -789,7 +382,7 @@ async function createApp() {
       .filter((j) => j.userId === user.id)
       .sort((a, b) => new Date(b.actualDepartureIso).getTime() - new Date(a.actualDepartureIso).getTime());
 
-    store.quota.liveApiConfigured = Boolean(getGoogleMapsApiKey());
+    store.quota.liveApiConfigured = Boolean(getGoogleMapsApiKey(env));
 
     res.json({
       serverClock: {
@@ -808,50 +401,53 @@ async function createApp() {
   });
 
   // 4. Update commute setup / schedule / locations / consent
-  app.put('/api/me/profile', requireAuth, (req: AuthedRequest, res) => {
-    const user = req.user!;
-    const body = req.body || {};
+  app.put('/api/me/profile', requireAuth, (req: AuthedRequest, res, next) => {
+    void runMutating(() => {
+      const user = req.user!;
+      const body = req.body || {};
 
-    if (body.homeLocation !== undefined) {
-      user.homeLocation = body.homeLocation;
-    }
-    if (body.workLocation !== undefined && body.workLocation !== null) {
-      user.workLocation = body.workLocation;
-    }
-    if (body.schedules) {
-      if (body.schedules.HOME_TO_WORK) {
-        user.schedules.HOME_TO_WORK = {
-          ...user.schedules.HOME_TO_WORK,
-          ...body.schedules.HOME_TO_WORK,
-        };
+      if (body.homeLocation !== undefined) {
+        user.homeLocation = body.homeLocation;
       }
-      if (body.schedules.WORK_TO_HOME) {
-        user.schedules.WORK_TO_HOME = {
-          ...user.schedules.WORK_TO_HOME,
-          ...body.schedules.WORK_TO_HOME,
-        };
+      if (body.workLocation !== undefined && body.workLocation !== null) {
+        user.workLocation = body.workLocation;
       }
-    }
-    if (typeof body.telemetryConsent === 'boolean') {
-      user.telemetryConsent = body.telemetryConsent;
-    }
-    if (typeof body.pushOptIn === 'boolean') {
-      user.pushOptIn = body.pushOptIn;
-    }
-    if (typeof body.onboardingComplete === 'boolean') {
-      user.onboardingComplete = body.onboardingComplete;
-    }
-    if (Array.isArray(body.dayOverrides)) {
-      user.dayOverrides = body.dayOverrides;
-    }
+      if (body.schedules) {
+        if (body.schedules.HOME_TO_WORK) {
+          user.schedules.HOME_TO_WORK = {
+            ...user.schedules.HOME_TO_WORK,
+            ...body.schedules.HOME_TO_WORK,
+          };
+        }
+        if (body.schedules.WORK_TO_HOME) {
+          user.schedules.WORK_TO_HOME = {
+            ...user.schedules.WORK_TO_HOME,
+            ...body.schedules.WORK_TO_HOME,
+          };
+        }
+      }
+      if (typeof body.telemetryConsent === 'boolean') {
+        user.telemetryConsent = body.telemetryConsent;
+      }
+      if (typeof body.pushOptIn === 'boolean') {
+        user.pushOptIn = body.pushOptIn;
+      }
+      if (typeof body.onboardingComplete === 'boolean') {
+        user.onboardingComplete = body.onboardingComplete;
+      }
+      if (Array.isArray(body.dayOverrides)) {
+        user.dayOverrides = body.dayOverrides;
+      }
 
-    saveStore(store);
-    res.json({ profile: sanitizeUserProfile(user) });
+      persistAll();
+      res.json({ profile: sanitizeUserProfile(user) });
+    }).catch(next);
   });
 
   // 5. Set or clear a DayOverride (Skip Today or Change Today's Commute Mode/Window/Deadline)
-  app.post('/api/me/day-override', requireAuth, (req: AuthedRequest, res) => {
-    const user = req.user!;
+  app.post('/api/me/day-override', requireAuth, (req: AuthedRequest, res, next) => {
+    void runMutating(() => {
+      const user = req.user!;
     const {
       dateIst = getNowIstParts().dateIst,
       direction,
@@ -882,323 +478,376 @@ async function createApp() {
     // If skipped today, mark any active session for today/direction as SKIPPED and stop alerts
     if (skipped) {
       for (const s of store.sessions) {
-        if (s.userId === user.id && s.dateIst === dateIst && s.direction === direction) {
+        if (s.userId === user.id && s.dateIst === dateIst && s.direction === direction &&
+            !['LEFT', 'SKIPPED', 'STOPPED', 'EXPIRED'].includes(s.status)) {
           s.status = 'SKIPPED';
           s.nextRefreshDueIso = null;
         }
       }
     }
 
-    saveStore(store);
-    res.json({
-      profile: sanitizeUserProfile(user),
-      sessions: store.sessions.filter((s) => s.userId === user.id && s.dateIst === dateIst),
-    });
+    persistAll();
+      res.json({
+        profile: sanitizeUserProfile(user),
+        sessions: store.sessions.filter((s) => s.userId === user.id && s.dateIst === dateIst),
+      });
+    }).catch(next);
   });
-
   // 6. Privacy Controls: Delete saved locations or delete personal journey history
-  app.delete('/api/me/locations', requireAuth, (req: AuthedRequest, res) => {
-    const user = req.user!;
-    user.homeLocation = null;
-    user.workLocation = { ...PRESTIGE_TECH_PARK_DEFAULT };
-    // Stop active sessions since home location was removed
-    for (const s of store.sessions) {
-      if (s.userId === user.id) {
-        s.status = 'STOPPED';
-        s.nextRefreshDueIso = null;
+  app.delete('/api/me/locations', requireAuth, (req: AuthedRequest, res, next) => {
+    void runMutating(() => {
+      const user = req.user!;
+      user.homeLocation = null;
+      user.workLocation = { ...PRESTIGE_TECH_PARK_DEFAULT };
+      // Stop active sessions since home location was removed
+      for (const s of store.sessions) {
+        if (s.userId === user.id && !['LEFT', 'SKIPPED', 'STOPPED', 'EXPIRED'].includes(s.status)) {
+          s.status = 'STOPPED';
+          s.nextRefreshDueIso = null;
+        }
       }
-    }
-    saveStore(store);
-    res.json({
-      message: 'Saved home location deleted from server storage.',
-      profile: sanitizeUserProfile(user),
-    });
+      persistAll();
+      res.json({
+        message: 'Saved home location deleted from server storage.',
+        profile: sanitizeUserProfile(user),
+      });
+    }).catch(next);
   });
 
-  app.delete('/api/me/journeys', requireAuth, (req: AuthedRequest, res) => {
-    const user = req.user!;
-    store.journeys = store.journeys.filter((j) => j.userId !== user.id);
-    store.alerts = store.alerts.filter((a) => a.userId !== user.id);
-    saveStore(store);
-    res.json({
-      message: 'All personal journey records and alert history deleted.',
-      journeys: [],
-      alerts: [],
-    });
+  app.delete('/api/me/journeys', requireAuth, (req: AuthedRequest, res, next) => {
+    void runMutating(() => {
+      const user = req.user!;
+      deleteUserJourneysAndAlerts(db, user.id);
+      store.journeys = store.journeys.filter((j) => j.userId !== user.id);
+      store.alerts = store.alerts.filter((a) => a.userId !== user.id);
+      res.json({
+        message: 'All personal journey records and alert history deleted.',
+        journeys: [],
+        alerts: [],
+      });
+    }).catch(next);
   });
 
   // 7. Address Search & Confirmation (Google Places API New in LIVE mode, or Curated Bengaluru Places in DEMO mode)
-  app.post('/api/places/search', requireAuth, async (req: AuthedRequest, res) => {
-    const { query, environment = 'LIVE' } = req.body || {};
-    const q = String(query || '').trim();
-    if (!q) {
-      res.json({ places: BENGALURU_PILOT_PLACES.slice(0, 6), source: 'PRESETS' });
-      return;
-    }
-
-    if (environment === 'DEMO') {
-      const lower = q.toLowerCase();
-      const matches = BENGALURU_PILOT_PLACES.filter(
-        (p) =>
-          p.label.toLowerCase().includes(lower) ||
-          p.address.toLowerCase().includes(lower)
-      );
-      res.json({
-        places: matches.length > 0 ? matches : BENGALURU_PILOT_PLACES.slice(0, 5),
-        source: 'DEMO_PRESETS',
-      });
-      return;
-    }
-
-    const apiKey = getGoogleMapsApiKey();
-    if (!apiKey) {
-      res.status(503).json({
-        error: 'LIVE_API_KEY_UNAVAILABLE',
-        message:
-          'Google Maps Platform API key is not configured for Live Places Search. Use manual coordinate/address entry or switch to Labeled Demo Mode.',
-      });
-      return;
-    }
-
-    const budget = checkBudgetAndIncrement('PLACES');
-    if (!budget.allowed) {
-      res.status(429).json({
-        quotaExceeded: true,
-        error: 'RESOURCE_EXHAUSTED',
-        message: budget.reason,
-      });
-      return;
-    }
-
+  app.post('/api/places/search', requireAuth, async (req: AuthedRequest, res, next) => {
     try {
-      const placesResp = await fetch(
-        'https://places.googleapis.com/v1/places:searchText',
-        {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-            'X-Goog-Api-Key': apiKey,
-            'X-Goog-FieldMask':
-              'places.id,places.displayName,places.formattedAddress,places.location',
-            'X-Goog-Maps-Solution-ID': 'gmp_mcp_codeassist_v1_aistudio',
-          },
-          body: JSON.stringify({
-            textQuery: q.toLowerCase().includes('bengaluru') || q.toLowerCase().includes('bangalore')
-              ? q
-              : `${q}, Bengaluru, Karnataka`,
-            regionCode: 'IN',
-            languageCode: 'en',
-            locationBias: {
-              circle: {
-                center: { latitude: 12.9438, longitude: 77.6939 },
-                radius: 35000.0,
-              },
-            },
-          }),
-        }
-      );
+      const { query, environment = 'LIVE' } = req.body || {};
+      const q = String(query || '').trim();
+      if (!q) {
+        res.json({ places: BENGALURU_PILOT_PLACES.slice(0, 6), source: 'PRESETS' });
+        return;
+      }
 
-      if (placesResp.status === 429) {
-        store.quota.lastProviderStatus = 'QUOTA_EXCEEDED';
-        saveStore(store);
+      if (environment === 'DEMO') {
+        const lower = q.toLowerCase();
+        const matches = BENGALURU_PILOT_PLACES.filter(
+          (p) =>
+            p.label.toLowerCase().includes(lower) ||
+            p.address.toLowerCase().includes(lower)
+        );
+        res.json({
+          places: matches.length > 0 ? matches : BENGALURU_PILOT_PLACES.slice(0, 5),
+          source: 'DEMO_PRESETS',
+        });
+        return;
+      }
+
+      const apiKey = getGoogleMapsApiKey(env);
+      if (!apiKey) {
+        res.status(503).json({
+          error: 'LIVE_API_KEY_UNAVAILABLE',
+          message:
+            'Google Maps Platform API key is not configured for Live Places Search. Use manual coordinate/address entry or switch to Labeled Demo Mode.',
+        });
+        return;
+      }
+
+      const budget = checkBudgetAndIncrement('PLACES');
+      if (!budget.allowed) {
         res.status(429).json({
           quotaExceeded: true,
           error: 'RESOURCE_EXHAUSTED',
-          message: 'Google Maps Places API quota exceeded.',
+          message: budget.reason,
         });
         return;
       }
 
-      const data = (await placesResp.json()) as any;
-      if (!placesResp.ok) {
-        const statusStr = data?.error?.status || '';
-        if (statusStr === 'RESOURCE_EXHAUSTED') {
+      try {
+        const placesResp = await fetch(
+          'https://places.googleapis.com/v1/places:searchText',
+          {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+              'X-Goog-Api-Key': apiKey,
+              'X-Goog-FieldMask':
+                'places.id,places.displayName,places.formattedAddress,places.location',
+              'X-Goog-Maps-Solution-ID': 'gmp_mcp_codeassist_v1_aistudio',
+            },
+            body: JSON.stringify({
+              textQuery: q.toLowerCase().includes('bengaluru') || q.toLowerCase().includes('bangalore')
+                ? q
+                : `${q}, Bengaluru, Karnataka`,
+              regionCode: 'IN',
+              languageCode: 'en',
+              locationBias: {
+                circle: {
+                  center: { latitude: 12.9438, longitude: 77.6939 },
+                  radius: 35000.0,
+                },
+              },
+            }),
+          }
+        );
+
+        if (placesResp.status === 429) {
+          mutateQuotaPersistSafe(db, store, (q) => {
+            q.lastProviderStatus = 'QUOTA_EXCEEDED';
+          });
           res.status(429).json({
             quotaExceeded: true,
             error: 'RESOURCE_EXHAUSTED',
-            message: data?.error?.message || 'Quota exceeded',
+            message: 'Google Maps Places API quota exceeded.',
           });
           return;
         }
+
+        const data = (await placesResp.json()) as any;
+        if (!placesResp.ok) {
+          const statusStr = data?.error?.status || '';
+          if (statusStr === 'RESOURCE_EXHAUSTED') {
+            res.status(429).json({
+              quotaExceeded: true,
+              error: 'RESOURCE_EXHAUSTED',
+              message: data?.error?.message || 'Quota exceeded',
+            });
+            return;
+          }
+          res.status(502).json({
+            error: 'PROVIDER_ERROR',
+            message: data?.error?.message || 'Places API search error',
+          });
+          return;
+        }
+
+        const nowIso = new Date().toISOString();
+        const places: LocationPoint[] = (data.places || []).slice(0, 6).map((p: any) => ({
+          label: p.displayName?.text || p.formattedAddress || q,
+          address: p.formattedAddress || p.displayName?.text || q,
+          lat: p.location?.latitude ?? 12.9438,
+          lng: p.location?.longitude ?? 77.6939,
+          placeId: p.id,
+          confirmedAt: nowIso,
+        }));
+
+        res.json({
+          places,
+          source: 'GOOGLE_PLACES_API_NEW',
+        });
+      } catch (err: any) {
         res.status(502).json({
           error: 'PROVIDER_ERROR',
-          message: data?.error?.message || 'Places API search error',
+          message: err?.message || 'Network error calling Places API (New)',
         });
-        return;
       }
-
-      const nowIso = new Date().toISOString();
-      const places: LocationPoint[] = (data.places || []).slice(0, 6).map((p: any) => ({
-        label: p.displayName?.text || p.formattedAddress || q,
-        address: p.formattedAddress || p.displayName?.text || q,
-        lat: p.location?.latitude ?? 12.9438,
-        lng: p.location?.longitude ?? 77.6939,
-        placeId: p.id,
-        confirmedAt: nowIso,
-      }));
-
-      res.json({
-        places,
-        source: 'GOOGLE_PLACES_API_NEW',
-      });
-    } catch (err: any) {
-      res.status(502).json({
-        error: 'PROVIDER_ERROR',
-        message: err?.message || 'Network error calling Places API (New)',
-      });
+    } catch (err) {
+      next(err);
     }
   });
 
   // 8. Compute Departure Recommendations & Start/Refresh Monitoring Session
-  app.post('/api/monitoring/start-or-refresh', requireAuth, async (req: AuthedRequest, res) => {
-    const user = req.user!;
-    const {
-      direction = 'HOME_TO_WORK',
-      environment = 'LIVE',
-      watchMode = 'ALL_OPTIONS',
-      selectedOptionId = null,
-      startMode = 'IMMEDIATE', // 'IMMEDIATE' | 'SCHEDULED_LEAD'
-      simulateTrafficSpikeMin = 0,
-    } = req.body || {};
+  app.post('/api/monitoring/start-or-refresh', requireAuth, (req: AuthedRequest, res, next) => {
+    void runMutating(async () => {
+      const user = req.user!;
+      const {
+        direction = 'HOME_TO_WORK',
+        environment = 'LIVE',
+        watchMode = 'ALL_OPTIONS',
+        selectedOptionId = null,
+        startMode = 'IMMEDIATE', // 'IMMEDIATE' | 'SCHEDULED_LEAD'
+        simulateTrafficSpikeMin = 0,
+      } = req.body || {};
 
-    const { dateIst } = getNowIstParts();
-    const nowIso = new Date().toISOString();
+      const { dateIst } = getNowIstParts();
+      const nowIso = new Date().toISOString();
+      const sessionId = `mon_${user.id}_${dateIst}_${direction}`;
+      const storedSession = db
+        .prepare('SELECT data, status, revision FROM sessions WHERE id = ? AND user_id = ?')
+        .get(sessionId, user.id) as
+        | { data: string; status: string; revision: number }
+        | undefined;
+      const expectedRevision = storedSession?.revision ?? null;
+      const terminalStatuses = ['STOPPED', 'SKIPPED', 'EXPIRED', 'LEFT'];
+      if (storedSession && terminalStatuses.includes(storedSession.status)) {
+        res.status(409).json({
+          error: 'MONITORING_SESSION_TERMINAL',
+          message: 'This monitoring session has ended and cannot be restarted for the same commute window.',
+        });
+        return;
+      }
+      let currentSession = storedSession
+        ? (JSON.parse(storedSession.data) as MonitoringSession)
+        : undefined;
+      if (currentSession) {
+        const memoryIndex = store.sessions.findIndex((entry) => entry.id === sessionId);
+        if (memoryIndex >= 0) store.sessions[memoryIndex] = currentSession;
+        else store.sessions.push(currentSession);
+      }
 
-    const result = await computeOptionsForUserDirection({
-      user,
-      direction,
-      environment,
-      simulateTrafficSpikeMin,
-    });
-
-    if (result.quotaExceeded) {
-      res.status(429).json({
-        quotaExceeded: true,
-        error: 'RESOURCE_EXHAUSTED',
-        message: result.providerError || 'API quota reached.',
-        quota: store.quota,
-      });
-      return;
-    }
-
-    if (result.providerError) {
-      res.status(502).json({
-        error: 'PROVIDER_ERROR',
-        message: result.providerError,
-        quota: store.quota,
-      });
-      return;
-    }
-
-    const effectiveSchedule = result.effectiveSchedule;
-    const expiresAtIso = istDateAndHhmmToIso(dateIst, effectiveSchedule.windowEnd);
-
-    let session = store.sessions.find(
-      (s) => s.userId === user.id && s.dateIst === dateIst && s.direction === direction
-    );
-
-    if (!session) {
-      session = {
-        id: `mon_${user.id}_${dateIst}_${direction}`,
-        userId: user.id,
-        dateIst,
+      const result = await computeOptions({
+        user,
         direction,
-        transportMode: effectiveSchedule.mode,
-        status: startMode === 'SCHEDULED_LEAD' ? 'SCHEDULED' : 'ACTIVE',
-        watchMode,
-        selectedOptionId,
-        selectedEstimateSnapshot: null,
-        departureEstimateSnapshot: null,
-        lastNotifiedArrivalIso: null,
-        lastNotifiedArrivalTimeIst: null,
-        snoozedUntilIso: null,
-        startedAtIso: nowIso,
-        lastRefreshedAtIso: nowIso,
-        nextRefreshDueIso: new Date(Date.now() + 5 * 60 * 1000).toISOString(),
-        expiresAtIso,
-        refreshCount: 0,
-        suppressedDuplicatesCount: 0,
-        latestOptions: result.options,
-        unsupportedModeReason: result.unsupportedReason || null,
-        dataEnvironment: environment,
+        environment,
+        simulateTrafficSpikeMin,
+        signal: AbortSignal.timeout(ROUTES_REQUEST_TIMEOUT_MS),
+      });
+
+      if (result.quotaExceeded) {
+        res.status(429).json({
+          quotaExceeded: true,
+          error: 'RESOURCE_EXHAUSTED',
+          message: result.providerError || 'API quota reached.',
+          quota: store.quota,
+        });
+        return;
+      }
+
+      if (result.providerError) {
+        res.status(502).json({
+          error: 'PROVIDER_ERROR',
+          message: result.providerError,
+          quota: store.quota,
+        });
+        return;
+      }
+
+      const effectiveSchedule = result.effectiveSchedule;
+      const expiresAtIso = istDateAndHhmmToIso(dateIst, effectiveSchedule.windowEnd);
+
+      let session = currentSession;
+
+      if (!session) {
+        session = {
+          id: sessionId,
+          userId: user.id,
+          dateIst,
+          direction,
+          transportMode: effectiveSchedule.mode,
+          status: startMode === 'SCHEDULED_LEAD' ? 'SCHEDULED' : 'ACTIVE',
+          watchMode,
+          selectedOptionId,
+          selectedEstimateSnapshot: null,
+          departureEstimateSnapshot: null,
+          lastNotifiedArrivalIso: null,
+          lastNotifiedArrivalTimeIst: null,
+          snoozedUntilIso: null,
+          startedAtIso: nowIso,
+          lastRefreshedAtIso: nowIso,
+          nextRefreshDueIso: new Date(Date.now() + 5 * 60 * 1000).toISOString(),
+          expiresAtIso,
+          refreshCount: 0,
+          suppressedDuplicatesCount: 0,
+          latestOptions: result.options,
+          unsupportedModeReason: result.unsupportedReason || null,
+          dataEnvironment: environment,
+        };
+        store.sessions.push(session);
+      } else {
+        session.transportMode = effectiveSchedule.mode;
+        session.dataEnvironment = environment;
+        session.expiresAtIso = expiresAtIso;
+        session.unsupportedModeReason = result.unsupportedReason || null;
+        if (selectedOptionId !== undefined && selectedOptionId !== null) {
+          session.selectedOptionId = selectedOptionId;
+        }
+        if (watchMode) {
+          session.watchMode = watchMode;
+        }
+      }
+
+      // If user selected a specific option and no immutable selectedEstimateSnapshot exists for it yet, record it
+      if (session.selectedOptionId) {
+        const chosen = result.options.find((o) => o.id === session!.selectedOptionId);
+        if (
+          chosen &&
+          (!session.selectedEstimateSnapshot ||
+            session.selectedEstimateSnapshot.optionId !== chosen.id)
+        ) {
+          session.selectedEstimateSnapshot = createImmutableSnapshot(
+            chosen,
+            'SELECTED_OPTION',
+            nowIso
+          );
+        }
+      }
+
+      const evalOutcome = evaluateMonitoringUpdate({
+        session,
+        schedule: effectiveSchedule,
+        newOptions: result.options,
+        nowIso,
+      });
+
+      const idx = store.sessions.findIndex((s) => s.id === session!.id);
+      if (idx !== -1) {
+        store.sessions[idx] = evalOutcome.updatedSession;
+      }
+
+      const requireUnchangedSession = () => {
+        const latest = db
+          .prepare('SELECT status, revision FROM sessions WHERE id = ? AND user_id = ?')
+          .get(sessionId, user.id) as { status: string; revision: number } | undefined;
+        if (
+          (expectedRevision === null && latest) ||
+          (expectedRevision !== null &&
+            (!latest || latest.revision !== expectedRevision || terminalStatuses.includes(latest.status)))
+        ) {
+          throw new SessionWriteConflict();
+        }
       };
-      store.sessions.push(session);
-    } else {
-      session.transportMode = effectiveSchedule.mode;
-      session.dataEnvironment = environment;
-      session.expiresAtIso = expiresAtIso;
-      session.unsupportedModeReason = result.unsupportedReason || null;
-      if (
-        session.status === 'STOPPED' ||
-        session.status === 'SKIPPED' ||
-        session.status === 'EXPIRED' ||
-        session.status === 'LEFT'
-      ) {
-        session.status = startMode === 'SCHEDULED_LEAD' ? 'SCHEDULED' : 'ACTIVE';
-        session.lastNotifiedArrivalIso = null;
-        session.lastNotifiedArrivalTimeIst = null;
+      try {
+        recordGeneratedAlerts(evalOutcome.generatedAlerts, requireUnchangedSession);
+      } catch (err) {
+        if (!(err instanceof SessionWriteConflict)) throw err;
+        reloadWorkingSet(db, store);
+        res.status(409).json({
+          error: 'MONITORING_SESSION_CHANGED',
+          message: 'The session changed while this request was calculating; reload and retry.',
+        });
+        return;
       }
-      if (selectedOptionId !== undefined && selectedOptionId !== null) {
-        session.selectedOptionId = selectedOptionId;
-      }
-      if (watchMode) {
-        session.watchMode = watchMode;
-      }
-    }
 
-    // If user selected a specific option and no immutable selectedEstimateSnapshot exists for it yet, record it
-    if (session.selectedOptionId) {
-      const chosen = result.options.find((o) => o.id === session!.selectedOptionId);
-      if (
-        chosen &&
-        (!session.selectedEstimateSnapshot ||
-          session.selectedEstimateSnapshot.optionId !== chosen.id)
-      ) {
-        session.selectedEstimateSnapshot = createImmutableSnapshot(
-          chosen,
-          'SELECTED_OPTION',
-          nowIso
-        );
-      }
-    }
-
-    const evalOutcome = evaluateMonitoringUpdate({
-      session,
-      schedule: effectiveSchedule,
-      newOptions: result.options,
-      nowIso,
-    });
-
-    const idx = store.sessions.findIndex((s) => s.id === session!.id);
-    if (idx !== -1) {
-      store.sessions[idx] = evalOutcome.updatedSession;
-    }
-    for (const alert of evalOutcome.generatedAlerts) {
-      store.alerts.unshift(alert);
-    }
-
-    saveStore(store);
-
-    res.json({
-      session: evalOutcome.updatedSession,
-      newAlerts: evalOutcome.generatedAlerts,
-      effectiveSchedule,
-      quota: store.quota,
-    });
+      res.json({
+        session: evalOutcome.updatedSession,
+        newAlerts: evalOutcome.generatedAlerts,
+        effectiveSchedule,
+        quota: store.quota,
+      });
+    }).catch(next);
   });
 
   // 9. Select a specific Departure Option to track (records immutable SELECTED_OPTION snapshot)
-  app.post('/api/monitoring/select-option', requireAuth, (req: AuthedRequest, res) => {
-    const user = req.user!;
+  app.post('/api/monitoring/select-option', requireAuth, (req: AuthedRequest, res, next) => {
+    void runMutating(() => {
+      const user = req.user!;
     const { sessionId, optionId, watchMode = 'SELECTED_OPTION' } = req.body || {};
 
-    const session = store.sessions.find(
+    const workingSession = store.sessions.find(
       (s) => s.id === sessionId && s.userId === user.id
     );
+    const durableSessionRow = db
+      .prepare('SELECT data FROM sessions WHERE id = ? AND user_id = ?')
+      .get(sessionId, user.id) as { data: string } | undefined;
+    const session = durableSessionRow
+      ? (JSON.parse(durableSessionRow.data) as MonitoringSession)
+      : workingSession;
     if (!session) {
       res.status(404).json({ error: 'SESSION_NOT_FOUND', message: 'Monitoring session not found.' });
       return;
     }
+    const memoryIndex = store.sessions.findIndex((entry) => entry.id === session.id);
+    if (memoryIndex >= 0) store.sessions[memoryIndex] = session;
+    else store.sessions.push(session);
 
     session.watchMode = watchMode;
     session.selectedOptionId = optionId;
@@ -1215,13 +864,15 @@ async function createApp() {
       session.lastNotifiedArrivalTimeIst = chosen.predictedArrivalTimeIst;
     }
 
-    saveStore(store);
+    persistAll();
     res.json({ session });
+    }).catch(next);
   });
 
   // 10. Monitoring Actions: "I've left", "Snooze 10 minutes", "Skip today", "Stop monitoring"
-  app.post('/api/monitoring/action', requireAuth, (req: AuthedRequest, res) => {
-    const user = req.user!;
+  app.post('/api/monitoring/action', requireAuth, (req: AuthedRequest, res, next) => {
+    void runMutating(() => {
+      const user = req.user!;
     const { sessionId, action } = req.body || {};
 
     const session = store.sessions.find(
@@ -1229,6 +880,32 @@ async function createApp() {
     );
     if (!session) {
       res.status(404).json({ error: 'SESSION_NOT_FOUND', message: 'Monitoring session not found.' });
+      return;
+    }
+
+    const terminalAction: Record<string, string> = {
+      IVE_LEFT: 'LEFT',
+      SKIP_TODAY: 'SKIPPED',
+      STOP_MONITORING: 'STOPPED',
+    };
+    const terminalStatuses = ['LEFT', 'SKIPPED', 'STOPPED', 'EXPIRED'];
+    if (terminalStatuses.includes(session.status)) {
+      if (terminalAction[action] === session.status) {
+      const existingJourney = store.journeys.find((journey) => journey.id === `jrn_${session.id}`) ?? null;
+        if (action === 'IVE_LEFT') {
+          res.json({ session, journey: existingJourney });
+        } else if (action === 'SKIP_TODAY') {
+          res.json({ session, profile: sanitizeUserProfile(user) });
+        } else {
+          res.json({ session });
+        }
+        return;
+      }
+      res.status(409).json({
+        error: 'INVALID_SESSION_TRANSITION',
+        message: `Action ${String(action)} is not valid for terminal session status ${session.status}.`,
+        status: session.status,
+      });
       return;
     }
 
@@ -1250,8 +927,7 @@ async function createApp() {
         deliveredChannels: ['IN_APP'],
         acknowledged: true,
       };
-      store.alerts.unshift(snoozeAlert);
-      saveStore(store);
+      recordGeneratedAlerts([snoozeAlert]);
       res.json({ session, alert: snoozeAlert });
       return;
     }
@@ -1267,7 +943,7 @@ async function createApp() {
         direction: session.direction,
         skipped: true,
       });
-      saveStore(store);
+      persistAll();
       res.json({ session, profile: sanitizeUserProfile(user) });
       return;
     }
@@ -1275,7 +951,7 @@ async function createApp() {
     if (action === 'STOP_MONITORING') {
       session.status = 'STOPPED';
       session.nextRefreshDueIso = null;
-      saveStore(store);
+      persistAll();
       res.json({ session });
       return;
     }
@@ -1310,7 +986,7 @@ async function createApp() {
             : user.homeLocation?.label || 'Home';
 
         createdJourney = {
-          id: `jrn_${user.id}_${Date.now()}`,
+          id: `jrn_${session.id}`,
           userId: user.id,
           dateIst: session.dateIst,
           direction: session.direction,
@@ -1338,17 +1014,19 @@ async function createApp() {
         store.journeys.unshift(createdJourney);
       }
 
-      saveStore(store);
+      persistAll();
       res.json({ session, journey: createdJourney });
       return;
     }
 
     res.status(400).json({ error: 'INVALID_ACTION', message: 'Unsupported monitoring action.' });
+    }).catch(next);
   });
 
   // 11. Complete a Journey or Correct Manually Entered Journey Times (Keeping Original Estimates Immutable!)
-  app.put('/api/journeys/:id', requireAuth, (req: AuthedRequest, res) => {
-    const user = req.user!;
+  app.put('/api/journeys/:id', requireAuth, (req: AuthedRequest, res, next) => {
+    void runMutating(() => {
+      const user = req.user!;
     const journeyId = req.params.id;
     const journeyIdx = store.journeys.findIndex(
       (j) => j.id === journeyId && j.userId === user.id
@@ -1398,9 +1076,9 @@ async function createApp() {
     }
 
     store.journeys[journeyIdx] = updated;
-    saveStore(store);
-
+    persistAll();
     res.json({ journey: updated });
+    }).catch(next);
   });
 
   // 12. Restricted Pilot Metrics Endpoint (Aggregate results ONLY — no personal addresses or individual user logs)
@@ -1418,106 +1096,206 @@ async function createApp() {
       report,
       quota: store.quota,
       schedulerStatus: {
-        durableInProcessLoopActive: true,
-        pollIntervalMinutes: 5,
-        webPushConfigured: Boolean(process.env.VAPID_PUBLIC_KEY && process.env.VAPID_PRIVATE_KEY),
+        inProcessLoopActive: scheduler.isLoopActive(),
+        pollIntervalSeconds: 60,
+        durableStateBackend: 'SQLite (state survives restart; execution requires a running server process)',
+        workerId: scheduler.workerId,
+        lastTickAtIso: scheduler.getLastTickAtMs()
+          ? new Date(scheduler.getLastTickAtMs()!).toISOString()
+          : null,
+        pushNativeEnabled: transport.enabled,
+        pushOutbox: outboxStatus(db, transport.enabled),
+        webPushConfigured: Boolean(env.VAPID_PUBLIC_KEY && env.VAPID_PRIVATE_KEY),
       },
     });
   });
 
   // 13. Update daily API quota limit safeguard
-  app.put('/api/pilot/quota-limit', requireAuth, (req: AuthedRequest, res) => {
+  app.put('/api/pilot/quota-limit', requireAuth, (req: AuthedRequest, res, next) => {
     const { dailyLimit } = req.body || {};
     const parsed = parseInt(String(dailyLimit), 10);
     if (!Number.isNaN(parsed) && parsed >= 10 && parsed <= 10000) {
-      store.quota.dailyLimit = parsed;
-      if (store.quota.requestsUsedToday < store.quota.dailyLimit && store.quota.lastProviderStatus === 'QUOTA_EXCEEDED') {
-        store.quota.lastProviderStatus = getGoogleMapsApiKey() ? 'OK' : 'UNCONFIGURED';
+      try {
+        mutateQuotaPersistSafe(db, store, (q) => {
+          q.dailyLimit = parsed;
+          if (
+            q.requestsUsedToday < q.dailyLimit &&
+            q.lastProviderStatus === 'QUOTA_EXCEEDED'
+          ) {
+            q.lastProviderStatus = getGoogleMapsApiKey(env) ? 'OK' : 'UNCONFIGURED';
+          }
+        });
+      } catch (err) {
+        next(err);
+        return;
       }
-      saveStore(store);
     }
     res.json({ quota: store.quota });
   });
 
-  // Durable Server-Side Scheduler Loop: checks active commute monitoring sessions every 60s
-  setInterval(async () => {
-    const nowMs = Date.now();
-    const nowIso = new Date(nowMs).toISOString();
-    const { dateIst, timeIst } = getNowIstParts();
-
-    for (let i = 0; i < store.sessions.length; i++) {
-      const s = store.sessions[i];
-      if (s.dateIst !== dateIst) continue;
-
-      // Activate SCHEDULED sessions when leadTime window is reached
-      if (s.status === 'SCHEDULED') {
-        const user = store.users.find((u) => u.id === s.userId);
-        if (!user) continue;
-        const eff = resolveEffectiveSchedule(
-          user.schedules[s.direction],
-          user.dayOverrides,
-          dateIst
-        );
-        const startLeadMin =
-          hhmmToMinutes(eff.preferredDeparture) - eff.leadTimeMinutes;
-        const currMin = hhmmToMinutes(timeIst);
-        if (currMin >= startLeadMin) {
-          s.status = 'ACTIVE';
-        }
-      }
-
-      if (s.status !== 'ACTIVE' && s.status !== 'SNOOZED') continue;
-      if (!s.nextRefreshDueIso) continue;
-
-      const dueMs = new Date(s.nextRefreshDueIso).getTime();
-      if (nowMs >= dueMs) {
-        const user = store.users.find((u) => u.id === s.userId);
-        if (!user) continue;
-
-        const res = await computeOptionsForUserDirection({
-          user,
-          direction: s.direction,
-          environment: s.dataEnvironment,
-        });
-
-        if (!res.providerError && !res.quotaExceeded) {
-          const outcome = evaluateMonitoringUpdate({
-            session: s,
-            schedule: res.effectiveSchedule,
-            newOptions: res.options,
-            nowIso,
-          });
-          store.sessions[i] = outcome.updatedSession;
-          for (const alert of outcome.generatedAlerts) {
-            store.alerts.unshift(alert);
-          }
-          saveStore(store);
-        }
-      }
+  // 14. Push device registration (authenticated; per-user scoped).
+  // Expo push tokens are accepted here, stored per user, and never returned in
+  // any other response or log line.
+  app.post('/api/me/devices', requireAuth, (req: AuthedRequest, res) => {
+    const user = req.user!;
+    const validationError = validateDeviceRegistration(req.body || {});
+    if (validationError) {
+      res.status(400).json({
+        error: validationError.code,
+        message: validationError.message,
+        field: validationError.field,
+      });
+      return;
     }
-  }, 60 * 1000);
+    const { expoPushToken, platform, installationId } = req.body;
+    const result = registerDevice(db, {
+      userId: user.id,
+      expoPushToken,
+      platform,
+      installationId,
+    });
+    if (!result.ok) {
+      res.status(result.status).json({
+        error: result.code,
+        message: result.message,
+      });
+      return;
+    }
+    res.status(201).json({ device: result.device });
+  });
+
+  app.get('/api/me/devices', requireAuth, (req: AuthedRequest, res) => {
+    res.json({ devices: listDevices(db, req.user!.id) });
+  });
+
+  app.delete('/api/me/devices/:installationId', requireAuth, (req: AuthedRequest, res) => {
+    const removed = removeDevice(db, req.user!.id, req.params.installationId);
+    if (!removed) {
+      res.status(404).json({
+        error: 'DEVICE_NOT_FOUND',
+        message: 'Device not registered for this employee.',
+      });
+      return;
+    }
+    res.json({ deleted: true, installationId: req.params.installationId });
+  });
+
+  // Honest per-user push/outbox status. Ticket 'SENT' means accepted by Expo,
+  // never delivered to the device; receiptPending/receiptOk describe FCM/APNs
+  // handoff only.
+  app.get('/api/me/push-status', requireAuth, (req: AuthedRequest, res) => {
+    const devices = listDevices(db, req.user!.id);
+    const summary = outboxStatus(db, transport.enabled, req.user!.id);
+    res.json({
+      nativePushEnabled: transport.enabled,
+      registeredDevices: devices.length,
+      outbox: summary,
+      deliveryDisclaimer:
+        'SENT means accepted by the Expo push service, not delivered to the device. receiptOk indicates the platform push service accepted the message.',
+    });
+  });
+
+  // Fail loudly: persistence or unexpected errors never produce a success response.
+  app.use((err: Error, _req: Request, res: Response, next: NextFunction) => {
+    if (res.headersSent) {
+      next(err);
+      return;
+    }
+    if (err instanceof StoreError && err.causeError instanceof SessionWriteConflict) {
+      res.status(409).json({
+        error: 'MONITORING_SESSION_CHANGED',
+        message: 'The session changed while this request was calculating; reload and retry.',
+      });
+      return;
+    }
+    if (err instanceof StoreError) {
+      console.error('[store] persistence failed:', err.message);
+      res.status(500).json({
+        error: 'PERSISTENCE_FAILED',
+        message:
+          'The server could not durably persist the change; it was not acknowledged. Retry shortly.',
+      });
+      return;
+    }
+    if (err instanceof SessionWriteConflict) {
+      res.status(409).json({
+        error: 'MONITORING_SESSION_CHANGED',
+        message: 'The session changed while this request was calculating; reload and retry.',
+      });
+      return;
+    }
+    console.error('[server] unhandled error:', err);
+    res.status(500).json({
+      error: 'INTERNAL_ERROR',
+      message: 'Unexpected server error.',
+    });
+  });
 
   // Serve Vite in development or static dist in production
-  if (process.env.NODE_ENV === 'production' && fs.existsSync(path.join(__dirname, 'dist'))) {
-    app.use(express.static(path.join(__dirname, 'dist')));
-    app.get('*', (_req, res) => {
-      res.sendFile(path.join(__dirname, 'dist', 'index.html'));
-    });
-  } else {
-    const { createServer: createViteServer } = await import('vite');
-    const vite = await createViteServer({
-      server: { middlewareMode: true },
-      appType: 'spa',
-    });
-    app.use(vite.middlewares);
+  if (!options.skipWebStack) {
+    if (env.NODE_ENV === 'production' && fs.existsSync(path.join(__dirname, 'dist'))) {
+      app.use(express.static(path.join(__dirname, 'dist')));
+      app.get('*', (_req, res) => {
+        res.sendFile(path.join(__dirname, 'dist', 'index.html'));
+      });
+    } else {
+      const { createServer: createViteServer } = await import('vite');
+      const vite = await createViteServer({
+        server: { middlewareMode: true },
+        appType: 'spa',
+      });
+      app.use(vite.middlewares);
+    }
   }
 
-  return app;
+  return {
+    app,
+    store,
+    db,
+    scheduler,
+    transport,
+    migrationNote,
+    close() {
+      scheduler.stop();
+      try {
+        db.close();
+      } catch (err) {
+        if (!(err instanceof Error && 'code' in err && err.code === 'ERR_INVALID_STATE')) {
+          console.error('[db] close failed:', err);
+        }
+      }
+    },
+  };
 }
 
-const PORT = Number(process.env.PORT) || 3000;
-createApp().then((app) => {
-  app.listen(PORT, '0.0.0.0', () => {
-    console.log(`ORR Pulse full-stack server running on http://0.0.0.0:${PORT}`);
-  });
-});
+// Direct-entry boot: `npm run dev` / `npm start` (tsx server.ts). Importing
+// createApp (e.g. from tests) has no server side effects.
+function isDirectEntry(): boolean {
+  const entry = process.argv[1];
+  if (!entry) return false;
+  try {
+    return fs.realpathSync(path.resolve(entry)) === fs.realpathSync(__filename);
+  } catch {
+    return false;
+  }
+}
+
+if (isDirectEntry()) {
+  const PORT = Number(process.env.PORT) || 3000;
+  createApp()
+    .then((handle) => {
+      handle.scheduler.start();
+      handle.app.listen(PORT, '0.0.0.0', () => {
+        console.log(`ORR Pulse full-stack server running on http://0.0.0.0:${PORT}`);
+        if (!handle.transport.enabled) {
+          console.log(
+            '[push] Native Expo push dispatch is DISABLED (set ENABLE_NATIVE_PUSH=true and optionally EXPO_ACCESS_TOKEN to enable).'
+          );
+        }
+      });
+    })
+    .catch((err) => {
+      console.error('Failed to start ORR Pulse server:', err);
+      process.exit(1);
+    });
+}

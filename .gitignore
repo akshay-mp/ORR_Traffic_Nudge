@@ -6,3 +6,12 @@ dist
 server.js
 .gmp_cache
 .data
+
+# Mobile (Expo) generated artifacts
+mobile/.expo/
+mobile/dist/
+mobile/web-build/
+mobile/.dart_tool/
+mobile/ios/
+mobile/android/
+*.hbc
